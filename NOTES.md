@@ -35,3 +35,37 @@
 - Fixed a Gymnasium 1.x API compatibility issue in CleanRL's episode-info detection logic (`final_info` → `infos["episode"]` / `infos["_episode"]`)
 
 **Next:** Week 7 — build a custom environment definition (reward shaping, domain randomization) for the actual G1 humanoid model, informed by this baseline result.
+
+## Week 7 — G1 Locomotion Environment: Root Cause Debugging & Resolution
+
+**Status: COMPLETE**
+
+### Deliverables
+- Working custom Gym-style environment (`g1_locomotion_env.py`) for the Unitree G1 humanoid, with:
+  - Reset logic using a hand-crafted stable standing pose (bent knees, compensating hip/ankle angles)
+  - PD position control (target = current angle + bounded delta, converted to torque via Kp/Kd)
+  - Reward function: forward velocity + alive bonus − effort penalty − height-sag penalty − fall penalty
+  - Fall detection based on pelvis height threshold (0.5m)
+- Validated via an isolated, policy-free PD-holds-pose test before any training
+- A trained PPO policy (`ppo_g1_locomotion_v10.zip`) that reliably survives ~435-627 steps per episode (up from ~120-129 steps across 9 earlier versions)
+- Confirmed live in the MuJoCo viewer: matches training statistics almost exactly (no train/inference mismatch)
+
+### The core bug (versions 1-9)
+Every version — different reward shaping, torque scaling, PD control, stable starting pose, parallelized training, 6M-step runs — plateaued at the exact same ~110-129 step survival time, regardless of the fix applied. 
+
+**Root cause: the robot model file (`g1_23dof.xml`) has no ground plane.** It's a bare robot definition, not a full "scene." The correct file to load is `scene_23dof.xml`, which combines the robot with an actual floor, lighting, and world setup. Without it, the robot was in pure free-fall the entire time — confirmed via an isolated PD-holds-pose test showing pelvis height accelerating into negative numbers (0.79 → 0.004 → -2.35 → -6.28 → ... ), the signature of unopposed gravity, not a balance failure.
+
+Once fixed (switching to `scene_23dof.xml`), the very next training run jumped from ep_len_mean ~123 to ~460 — a ~4x improvement — with no other code changes.
+
+### Other real fixes made along the way (all still necessary, just not sufficient alone)
+1. **Action/torque scaling** — policy actions in [-1, 1] were being sent directly as torque commands, when real actuator ranges go up to ±139 N·m. Fixed by scaling actions to each actuator's real `ctrlrange`.
+2. **PD position control** — switched from raw torque control to target-position + PD (Kp/Kd) control, standard practice for humanoid RL, since raw torque exploration is notoriously hard to learn from.
+3. **Bounded delta actions** — changed the policy's target from an absolute position across the full joint range to a small bounded delta from the current position, fixing PPO's `approx_kl`/`clip_fraction` instability (both were far above healthy values before this fix).
+4. **Stable starting pose** — the model has no predefined keyframe; resetting to all-zero joint angles produced an unnaturally rigid, unstable stance. Replaced with a hand-crafted bent-knee standing pose.
+5. **PD gain tuning** — increased Kp (80→180) and Kd (5→8) after an isolation test showed the original gains couldn't hold the standing pose against gravity for more than ~600 steps even with zero policy noise.
+
+### Current limitation (carried into Week 8)
+The trained policy survives ~435-627 steps but does so by staying in a low, crouched, largely static position — not by walking. This is a reward-shaping issue, not an environment bug: `alive_bonus` and the fall/height penalties currently dominate over `forward_velocity`, so the policy found "survive by staying low and rigid" as a local optimum rather than being pushed to actually walk. Fixing this (stronger forward-velocity weighting, possibly a standing-still penalty) is Week 8's problem, not Week 7's.
+
+### Key lesson
+When multiple independent, reasonable fixes all fail to move the same metric in the same way, stop iterating on secondary hypotheses and look for a shared, structural assumption underneath all of them. Here, that assumption — "the robot is standing on a floor" — was silently false the entire time, and every other diagnosis (reward, control scheme, training duration, parallelization) was solving real but secondary problems on top of a fundamentally broken physical setup.
